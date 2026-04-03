@@ -1,13 +1,14 @@
 import { createServer } from 'node:http';
 import { readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const HOST = process.env.HOST ?? '127.0.0.1';
 const PORT = Number(process.env.PORT ?? '4141');
-const AUTH_FILE = process.env.CODEX_AUTH_FILE ?? '/Users/concefly/.codex/auth.json';
+const DEFAULT_AUTH_FILE = join(homedir(), '.codex', 'auth.json');
+const AUTH_FILE = process.env.CODEX_AUTH_FILE ?? DEFAULT_AUTH_FILE;
 const UPSTREAM_BASE_URL = (process.env.CODEX_UPSTREAM_BASE_URL ?? 'https://chatgpt.com/backend-api/codex').replace(/\/$/, '');
 const REFRESH_URL = process.env.CODEX_REFRESH_URL ?? 'https://auth.openai.com/oauth/token';
 const CLIENT_ID = process.env.CODEX_CLIENT_ID ?? 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -786,7 +787,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 
 export {
   ANTHROPIC_VERSION_HEADER,
+  AUTH_FILE,
   buildResponsesRequest,
+  DEFAULT_AUTH_FILE,
   estimateInputTokens,
   parseRequestContext,
   requireAnthropicHeaders,

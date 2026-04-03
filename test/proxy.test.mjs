@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   ANTHROPIC_VERSION_HEADER,
+  AUTH_FILE,
   buildResponsesRequest,
+  DEFAULT_AUTH_FILE,
   estimateInputTokens,
   parseRequestContext,
   requireAnthropicHeaders,
@@ -89,6 +93,13 @@ test('`estimateInputTokens` counts text, system and tools', () => {
   });
 
   assert.ok(count >= 10);
+});
+
+test('default auth file comes from current home directory', () => {
+  assert.equal(DEFAULT_AUTH_FILE, join(homedir(), '.codex', 'auth.json'));
+  if (!process.env.CODEX_AUTH_FILE) {
+    assert.equal(AUTH_FILE, DEFAULT_AUTH_FILE);
+  }
 });
 
 test('`requireAnthropicHeaders` rejects missing version header', () => {
