@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { createServer as createHttpServer } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { WebSocketServer } from 'ws';
 
 import {
   ANTHROPIC_VERSION_HEADER,
@@ -17,9 +19,10 @@ import {
   requireAnthropicHeaders,
   resetSessionState,
   rememberSessionResponse,
-  server,
   streamAnthropicResponse
 } from '../src/index.mjs';
+
+const MODULE_URL = pathToFileURL(new URL('../src/index.mjs', import.meta.url).pathname).href;
 
 function createFakeReq(headers = {}) {
   return {
@@ -60,6 +63,57 @@ function createSseStream(events) {
       controller.close();
     }
   });
+}
+
+async function readReadableStream(stream) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let output = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    output += decoder.decode(value, { stream: true });
+  }
+  output += decoder.decode();
+  return output;
+}
+
+async function importProxyModuleWithEnv(env) {
+  const previous = new Map();
+  for (const [key, value] of Object.entries(env)) {
+    previous.set(key, process.env[key]);
+    if (value == null) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  try {
+    return await import(`${MODULE_URL}?t=${Date.now()}-${Math.random()}`);
+  } finally {
+    for (const [key, value] of previous) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+async function withProxyServerEnv(env, run) {
+  const proxy = await importProxyModuleWithEnv(env);
+  proxy.resetSessionState();
+  await new Promise((resolve) => proxy.server.listen(0, '127.0.0.1', resolve));
+  const address = proxy.server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  try {
+    await run(proxy, baseUrl);
+  } finally {
+    await new Promise((resolve, reject) => proxy.server.close((error) => (error ? reject(error) : resolve())));
+  }
 }
 
 test('`buildResponsesRequest` keeps assistant history as `output_text`', () => {
@@ -209,27 +263,74 @@ test('`createContinuationRequest` keeps per-model session buckets separate', () 
   assert.equal(request.request.previous_response_id, 'resp-sonnet');
 });
 
+test('`createContinuationRequest` keeps per-branch session buckets separate within one Claude session', () => {
+  resetSessionState();
+  rememberSessionResponse('shared-session', {
+    model: 'claude-sonnet-4-6',
+    messages: [{ role: 'user', content: 'review efficiency only' }]
+  }, 'resp-efficiency');
+  rememberSessionResponse('shared-session', {
+    model: 'claude-sonnet-4-6',
+    messages: [{ role: 'user', content: 'review reuse opportunities only' }]
+  }, 'resp-reuse');
+
+  const request = createContinuationRequest(
+    {
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'user', content: 'review reuse opportunities only' },
+        { role: 'assistant', content: 'done' }
+      ]
+    },
+    { claudeSessionId: 'shared-session' },
+    buildResponsesRequest({
+      model: 'claude-sonnet-4-6',
+      messages: [
+        { role: 'user', content: 'review reuse opportunities only' },
+        { role: 'assistant', content: 'done' }
+      ]
+    }, { claudeSessionId: 'shared-session' })
+  );
+
+  assert.equal(request.usedContinuation, true);
+  assert.equal(request.continuationReason, 'continued');
+  assert.equal(request.request.previous_response_id, 'resp-reuse');
+});
+
 test('`createContinuationRequest` reports prefix mismatch reason', () => {
   resetSessionState();
   rememberSessionResponse('session-1', {
     model: 'claude-sonnet-4-6',
-    messages: [{ role: 'user', content: 'hello' }]
+    messages: [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'world' }
+    ]
   }, 'resp-1');
 
   const request = createContinuationRequest(
     {
       model: 'claude-sonnet-4-6',
-      messages: [{ role: 'user', content: 'different history' }]
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'different history' }
+      ]
     },
     { claudeSessionId: 'session-1' },
     buildResponsesRequest({
       model: 'claude-sonnet-4-6',
-      messages: [{ role: 'user', content: 'different history' }]
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'different history' }
+      ]
     }, { claudeSessionId: 'session-1' })
   );
 
   assert.equal(request.usedContinuation, false);
   assert.equal(request.continuationReason, 'messages_prefix_mismatch');
+  assert.equal(request.diagnostics.messagesDiff.mismatchIndex, 1);
+  assert.equal(request.diagnostics.messagesDiff.previousMessage.role, 'assistant');
+  assert.match(request.diagnostics.messagesDiff.previousMessage.preview, /world/);
+  assert.match(request.diagnostics.messagesDiff.currentMessage.preview, /different history/);
 });
 
 test('`createContinuationRequest` includes system diff diagnostics on system mismatch', () => {
@@ -365,11 +466,8 @@ test('`streamAnthropicResponse` emits text, ping and tool_use events', async () 
 });
 
 test('server returns request-id and 400 on missing `anthropic-version`', { concurrency: false }, async () => {
-  resetSessionState();
-  server.listen(4141, '127.0.0.1');
-  await once(server, 'listening');
-  try {
-    const response = await fetch('http://127.0.0.1:4141/v1/messages/count_tokens', {
+  await withProxyServerEnv({ CODEX_UPSTREAM_WEBSOCKETS: '0' }, async (_proxy, baseUrl) => {
+    const response = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -381,13 +479,10 @@ test('server returns request-id and 400 on missing `anthropic-version`', { concu
     assert.ok(response.headers.get('request-id'));
     assert.equal(payload.type, 'error');
     assert.match(payload.error.message, /anthropic-version/);
-  } finally {
-    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-  }
+  });
 });
 
 test('server implements `/v1/messages/count_tokens`', { concurrency: false }, async () => {
-  resetSessionState();
   const originalFetch = globalThis.fetch;
   let upstreamBody = null;
   globalThis.fetch = async (url, options = {}) => {
@@ -403,39 +498,37 @@ test('server implements `/v1/messages/count_tokens`', { concurrency: false }, as
     }
     return originalFetch(url, options);
   };
-  server.listen(4141, '127.0.0.1');
-  await once(server, 'listening');
   try {
-    const response = await fetch('http://127.0.0.1:4141/v1/messages/count_tokens', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        [ANTHROPIC_VERSION_HEADER]: '2023-06-01',
-        'x-claude-code-session-id': 'session-123'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        system: 'You are helpful.',
-        messages: [{ role: 'user', content: 'hello' }]
-      })
-    });
-    const payload = await response.json();
-    assert.equal(response.status, 200);
-    assert.ok(response.headers.get('request-id'));
-    assert.equal(payload.input_tokens, 42);
-    assert.deepEqual(upstreamBody.input[0], {
-      type: 'message',
-      role: 'user',
-      content: [{ type: 'input_text', text: 'hello' }]
+    await withProxyServerEnv({ CODEX_UPSTREAM_WEBSOCKETS: '0' }, async (_proxy, baseUrl) => {
+      const response = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          [ANTHROPIC_VERSION_HEADER]: '2023-06-01',
+          'x-claude-code-session-id': 'session-123'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          system: 'You are helpful.',
+          messages: [{ role: 'user', content: 'hello' }]
+        })
+      });
+      const payload = await response.json();
+      assert.equal(response.status, 200);
+      assert.ok(response.headers.get('request-id'));
+      assert.equal(payload.input_tokens, 42);
+      assert.deepEqual(upstreamBody.input[0], {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'hello' }]
+      });
     });
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     globalThis.fetch = originalFetch;
   }
 });
 
 test('server forwards Anthropic image blocks to upstream `input_image`', { concurrency: false }, async () => {
-  resetSessionState();
   const originalFetch = globalThis.fetch;
   let upstreamBody = null;
   globalThis.fetch = async (url, options = {}) => {
@@ -451,46 +544,44 @@ test('server forwards Anthropic image blocks to upstream `input_image`', { concu
     }
     return originalFetch(url, options);
   };
-  server.listen(4141, '127.0.0.1');
-  await once(server, 'listening');
   try {
-    const response = await fetch('http://127.0.0.1:4141/v1/messages/count_tokens', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        [ANTHROPIC_VERSION_HEADER]: '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        messages: [{
-          role: 'user',
-          content: [{
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: 'image/png',
-              data: 'Zm9v'
-            }
+    await withProxyServerEnv({ CODEX_UPSTREAM_WEBSOCKETS: '0' }, async (_proxy, baseUrl) => {
+      const response = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          [ANTHROPIC_VERSION_HEADER]: '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          messages: [{
+            role: 'user',
+            content: [{
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: 'Zm9v'
+              }
+            }]
           }]
-        }]
-      })
-    });
-    const payload = await response.json();
-    assert.equal(response.status, 200);
-    assert.equal(payload.input_tokens, 64);
-    assert.deepEqual(upstreamBody.input[0], {
-      type: 'message',
-      role: 'user',
-      content: [{ type: 'input_image', image_url: 'data:image/png;base64,Zm9v' }]
+        })
+      });
+      const payload = await response.json();
+      assert.equal(response.status, 200);
+      assert.equal(payload.input_tokens, 64);
+      assert.deepEqual(upstreamBody.input[0], {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_image', image_url: 'data:image/png;base64,Zm9v' }]
+      });
     });
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     globalThis.fetch = originalFetch;
   }
 });
 
 test('server falls back to estimated count_tokens when upstream input_tokens is forbidden html', { concurrency: false }, async () => {
-  resetSessionState();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
     if (url === 'https://chatgpt.com/backend-api/codex/responses/input_tokens') {
@@ -501,32 +592,30 @@ test('server falls back to estimated count_tokens when upstream input_tokens is 
     }
     return originalFetch(url, options);
   };
-  server.listen(4141, '127.0.0.1');
-  await once(server, 'listening');
   try {
-    const response = await fetch('http://127.0.0.1:4141/v1/messages/count_tokens', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        [ANTHROPIC_VERSION_HEADER]: '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        system: 'You are helpful.',
-        messages: [{ role: 'user', content: 'hello world' }]
-      })
+    await withProxyServerEnv({ CODEX_UPSTREAM_WEBSOCKETS: '0' }, async (_proxy, baseUrl) => {
+      const response = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          [ANTHROPIC_VERSION_HEADER]: '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          system: 'You are helpful.',
+          messages: [{ role: 'user', content: 'hello world' }]
+        })
+      });
+      const payload = await response.json();
+      assert.equal(response.status, 200);
+      assert.ok(payload.input_tokens > 0);
     });
-    const payload = await response.json();
-    assert.equal(response.status, 200);
-    assert.ok(payload.input_tokens > 0);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     globalThis.fetch = originalFetch;
   }
 });
 
 test('server reuses previous_response_id with incremental input for same Claude session', { concurrency: false }, async () => {
-  resetSessionState();
   const originalFetch = globalThis.fetch;
   const upstreamBodies = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -547,62 +636,60 @@ test('server reuses previous_response_id with incremental input for same Claude 
     }
     return originalFetch(url, options);
   };
-  server.listen(4141, '127.0.0.1');
-  await once(server, 'listening');
   try {
-    const headers = {
-      'content-type': 'application/json',
-      [ANTHROPIC_VERSION_HEADER]: '2023-06-01',
-      'x-claude-code-session-id': 'session-abc'
-    };
-    const first = await fetch('http://127.0.0.1:4141/v1/messages', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        stream: false,
-        messages: [{ role: 'user', content: 'hello' }]
-      })
-    });
-    assert.equal(first.status, 200);
+    await withProxyServerEnv({ CODEX_UPSTREAM_WEBSOCKETS: '0' }, async (_proxy, baseUrl) => {
+      const headers = {
+        'content-type': 'application/json',
+        [ANTHROPIC_VERSION_HEADER]: '2023-06-01',
+        'x-claude-code-session-id': 'session-abc'
+      };
+      const first = await fetch(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: false,
+          messages: [{ role: 'user', content: 'hello' }]
+        })
+      });
+      assert.equal(first.status, 200);
 
-    const second = await fetch('http://127.0.0.1:4141/v1/messages', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        stream: false,
-        messages: [
-          { role: 'user', content: 'hello' },
-          { role: 'assistant', content: 'world' },
-          { role: 'user', content: 'follow up' }
-        ]
-      })
+      const second = await fetch(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: false,
+          messages: [
+            { role: 'user', content: 'hello' },
+            { role: 'assistant', content: 'world' },
+            { role: 'user', content: 'follow up' }
+          ]
+        })
+      });
+      assert.equal(second.status, 200);
+      assert.equal(upstreamBodies.length, 2);
+      assert.equal(upstreamBodies[0].previous_response_id, undefined);
+      assert.equal(upstreamBodies[1].previous_response_id, 'resp-1');
+      assert.deepEqual(upstreamBodies[1].input, [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'world' }]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'follow up' }]
+        }
+      ]);
     });
-    assert.equal(second.status, 200);
-    assert.equal(upstreamBodies.length, 2);
-    assert.equal(upstreamBodies[0].previous_response_id, undefined);
-    assert.equal(upstreamBodies[1].previous_response_id, 'resp-1');
-    assert.deepEqual(upstreamBodies[1].input, [
-      {
-        type: 'message',
-        role: 'assistant',
-        content: [{ type: 'output_text', text: 'world' }]
-      },
-      {
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: 'follow up' }]
-      }
-    ]);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     globalThis.fetch = originalFetch;
   }
 });
 
 test('continuation request falls back to full context when previous_response_id is not found', async () => {
-  resetSessionState();
   const originalFetch = globalThis.fetch;
   const upstreamBodies = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -628,12 +715,14 @@ test('continuation request falls back to full context when previous_response_id 
     return originalFetch(url, options);
   };
   try {
+    const proxy = await importProxyModuleWithEnv({ CODEX_UPSTREAM_WEBSOCKETS: '0' });
+    proxy.resetSessionState();
     const firstBody = {
       model: 'claude-sonnet-4-6',
       stream: false,
       messages: [{ role: 'user', content: 'hello' }]
     };
-    rememberSessionResponse('session-retry', firstBody, 'resp-1');
+    proxy.rememberSessionResponse('session-retry', firstBody, 'resp-1');
     const secondBody = {
       model: 'claude-sonnet-4-6',
       stream: false,
@@ -643,12 +732,12 @@ test('continuation request falls back to full context when previous_response_id 
         { role: 'user', content: 'follow up' }
       ]
     };
-    const prepared = createContinuationRequest(
+    const prepared = proxy.createContinuationRequest(
       secondBody,
       { claudeSessionId: 'session-retry' },
-      buildResponsesRequest(secondBody, { claudeSessionId: 'session-retry' })
+      proxy.buildResponsesRequest(secondBody, { claudeSessionId: 'session-retry' })
     );
-    const response = await callCodexResponsesWithFallback(prepared, {
+    const response = await proxy.callCodexResponsesWithFallback(prepared, {
       tokens: { access_token: 'test-token' }
     });
     assert.equal(response.status, 200);
@@ -674,5 +763,225 @@ test('continuation request falls back to full context when previous_response_id 
     ]);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('`callCodexResponsesWithFallback` can stream over upstream websocket', async () => {
+  const httpServer = createHttpServer();
+  const websocketServer = new WebSocketServer({ noServer: true });
+  const messages = [];
+  let handshakeHeaders = null;
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    handshakeHeaders = request.headers;
+    websocketServer.handleUpgrade(request, socket, head, (ws) => {
+      websocketServer.emit('connection', ws, request);
+    });
+  });
+
+  websocketServer.on('connection', (ws) => {
+    ws.on('message', (raw) => {
+      messages.push(JSON.parse(raw.toString('utf8')));
+      ws.send(JSON.stringify({ type: 'response.created', response: { id: 'resp-ws-1' } }));
+      ws.send(JSON.stringify({
+        type: 'response.output_text.delta',
+        delta: 'OK'
+      }));
+      ws.send(JSON.stringify({
+        type: 'response.completed',
+        response: {
+          id: 'resp-ws-1',
+          usage: { input_tokens: 12, output_tokens: 4, input_tokens_details: { cached_tokens: 3 } }
+        }
+      }));
+    });
+  });
+
+  await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address();
+  const proxy = await importProxyModuleWithEnv({
+    CODEX_UPSTREAM_BASE_URL: `http://127.0.0.1:${port}`
+  });
+
+  try {
+    proxy.resetSessionState();
+    const context = {
+      claudeSessionId: 'session-ws',
+      requestId: 'req-ws'
+    };
+    const body = {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hello websocket' }]
+    };
+    const prepared = proxy.createContinuationRequest(
+      body,
+      context,
+      proxy.buildResponsesRequest(body, context)
+    );
+    const upstream = await proxy.callCodexResponsesWithFallback(prepared, {
+      tokens: {
+        access_token: 'access-token',
+        account_id: 'acct-123'
+      }
+    }, context);
+
+    const payload = await readReadableStream(upstream.body);
+    assert.match(payload, /response\.created/);
+    assert.match(payload, /response\.output_text\.delta/);
+    assert.match(payload, /response\.completed/);
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].type, 'response.create');
+    assert.equal(messages[0].model, 'gpt-5.4');
+    assert.equal(messages[0].input[0].content[0].text, 'hello websocket');
+    assert.equal(handshakeHeaders.authorization, 'Bearer access-token');
+    assert.equal(handshakeHeaders['chatgpt-account-id'], 'acct-123');
+    assert.equal(handshakeHeaders['openai-beta'], 'responses_websockets=2026-02-06');
+  } finally {
+    proxy.resetSessionState();
+    await new Promise((resolve, reject) => websocketServer.close((error) => (error ? reject(error) : resolve())));
+    await new Promise((resolve, reject) => httpServer.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test('`callCodexResponsesWithFallback` degrades to http after websocket handshake failure', async () => {
+  const httpServer = createHttpServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/responses') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        [
+          `event: message\ndata: ${JSON.stringify({ type: 'response.created', response: { id: 'resp-http-1' } })}\n\n`,
+          `event: message\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp-http-1', usage: { input_tokens: 9, output_tokens: 2 } } })}\n\n`
+        ].join('')
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  httpServer.on('upgrade', (_req, socket) => {
+    socket.write('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+  });
+
+  await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address();
+  const proxy = await importProxyModuleWithEnv({
+    CODEX_UPSTREAM_BASE_URL: `http://127.0.0.1:${port}`
+  });
+
+  try {
+    proxy.resetSessionState();
+    const context = {
+      claudeSessionId: 'session-http-fallback',
+      requestId: 'req-http-fallback'
+    };
+    const body = {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hello fallback' }]
+    };
+    const prepared = proxy.createContinuationRequest(
+      body,
+      context,
+      proxy.buildResponsesRequest(body, context)
+    );
+    const upstream = await proxy.callCodexResponsesWithFallback(prepared, {
+      tokens: { access_token: 'access-token' }
+    }, context);
+
+    const payload = await readReadableStream(upstream.body);
+    assert.match(payload, /response\.completed/);
+
+    const secondUpstream = await proxy.callCodexResponsesWithFallback(prepared, {
+      tokens: { access_token: 'access-token' }
+    }, context);
+    const secondPayload = await readReadableStream(secondUpstream.body);
+    assert.match(secondPayload, /response\.completed/);
+  } finally {
+    proxy.resetSessionState();
+    await new Promise((resolve, reject) => httpServer.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test('`callCodexResponsesWithFallback` serializes websocket requests within one bucket', async () => {
+  const httpServer = createHttpServer();
+  const websocketServer = new WebSocketServer({ noServer: true });
+  const messages = [];
+  let releaseFirstResponse;
+  const firstResponseReleased = new Promise((resolve) => {
+    releaseFirstResponse = resolve;
+  });
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    websocketServer.handleUpgrade(request, socket, head, (ws) => {
+      websocketServer.emit('connection', ws, request);
+    });
+  });
+
+  websocketServer.on('connection', (ws) => {
+    ws.on('message', async (raw) => {
+      const payload = JSON.parse(raw.toString('utf8'));
+      messages.push(payload);
+      const responseId = `resp-ws-${messages.length}`;
+      ws.send(JSON.stringify({ type: 'response.created', response: { id: responseId } }));
+      if (messages.length === 1) {
+        await firstResponseReleased;
+      }
+      ws.send(JSON.stringify({
+        type: 'response.completed',
+        response: {
+          id: responseId,
+          usage: { input_tokens: 12, output_tokens: 4 }
+        }
+      }));
+    });
+  });
+
+  await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address();
+  const proxy = await importProxyModuleWithEnv({
+    CODEX_UPSTREAM_BASE_URL: `http://127.0.0.1:${port}`
+  });
+
+  try {
+    proxy.resetSessionState();
+    const context = {
+      claudeSessionId: 'session-ws-serial',
+      requestId: 'req-ws-serial'
+    };
+    const body = {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hello websocket' }]
+    };
+    const prepared = proxy.createContinuationRequest(
+      body,
+      context,
+      proxy.buildResponsesRequest(body, context)
+    );
+
+    const firstUpstreamPromise = proxy.callCodexResponsesWithFallback(prepared, {
+      tokens: { access_token: 'access-token' }
+    }, context);
+    const secondUpstreamPromise = proxy.callCodexResponsesWithFallback(prepared, {
+      tokens: { access_token: 'access-token' }
+    }, context);
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(messages.length, 1);
+
+    releaseFirstResponse();
+
+    const firstUpstream = await firstUpstreamPromise;
+    const secondUpstream = await secondUpstreamPromise;
+    const firstPayload = await readReadableStream(firstUpstream.body);
+    const secondPayload = await readReadableStream(secondUpstream.body);
+
+    assert.match(firstPayload, /response\.completed/);
+    assert.match(secondPayload, /response\.completed/);
+    assert.equal(messages.length, 2);
+  } finally {
+    proxy.resetSessionState();
+    await new Promise((resolve, reject) => websocketServer.close((error) => (error ? reject(error) : resolve())));
+    await new Promise((resolve, reject) => httpServer.close((error) => (error ? reject(error) : resolve())));
   }
 });

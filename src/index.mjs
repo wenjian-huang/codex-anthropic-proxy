@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import WebSocket from 'ws';
 
 const HOST = process.env.HOST ?? '127.0.0.1';
 const PORT = Number(process.env.PORT ?? '4141');
@@ -13,8 +14,13 @@ const UPSTREAM_BASE_URL = (process.env.CODEX_UPSTREAM_BASE_URL ?? 'https://chatg
 const REFRESH_URL = process.env.CODEX_REFRESH_URL ?? 'https://auth.openai.com/oauth/token';
 const CLIENT_ID = process.env.CODEX_CLIENT_ID ?? 'app_EMoamEEZ73f0CkXaXp7hrann';
 const TOKEN_REFRESH_SKEW_SECONDS = Number(process.env.CODEX_TOKEN_REFRESH_SKEW_SECONDS ?? '60');
+const UPSTREAM_WS_IDLE_TIMEOUT_MS = Number(process.env.CODEX_UPSTREAM_WS_IDLE_TIMEOUT_MS ?? '90000');
+const UPSTREAM_WS_CONNECT_TIMEOUT_MS = Number(process.env.CODEX_UPSTREAM_WS_CONNECT_TIMEOUT_MS ?? '15000');
+const UPSTREAM_WS_ENABLED = process.env.CODEX_UPSTREAM_WEBSOCKETS !== '0';
 const DEBUG = process.env.DEBUG_PROXY === '1';
 const VERBOSE = process.env.PROXY_VERBOSE !== '0';
+const OPENAI_BETA_HEADER = 'OpenAI-Beta';
+const RESPONSES_WS_BETA_HEADER = 'responses_websockets=2026-02-06';
 
 const MODEL_MAP = {
   default: process.env.CODEX_DEFAULT_MODEL ?? 'gpt-5.4',
@@ -62,6 +68,20 @@ function cloneJson(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
 }
 
+class UpstreamWebSocketFallbackError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'UpstreamWebSocketFallbackError';
+  }
+}
+
+class UpstreamPreviousResponseNotFoundError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'UpstreamPreviousResponseNotFoundError';
+  }
+}
+
 function extractCachedInputTokens(usage) {
   return usage?.input_tokens_details?.cached_tokens
     ?? usage?.cached_input_tokens
@@ -74,6 +94,20 @@ function stableHash(value) {
 
 function previewText(value, maxLength = 80) {
   const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength)}...`;
+}
+
+function summarizeErrorBody(body, maxLength = 160) {
+  if (!body) {
+    return 'empty body';
+  }
+  const normalized = body.replace(/\s+/g, ' ').trim();
+  if (normalized.startsWith('<html') || normalized.includes('<body')) {
+    return 'html challenge page';
+  }
   if (normalized.length <= maxLength) {
     return normalized;
   }
@@ -118,6 +152,65 @@ function summarizeSystemDiff(previousSystem, currentSystem) {
     currentMiddleLength: currentMiddle.length,
     previousPreview: previewText(previousMiddle),
     currentPreview: previewText(currentMiddle)
+  };
+}
+
+function summarizeMessageValue(value) {
+  if (typeof value === 'string') {
+    return previewText(value);
+  }
+  try {
+    return previewText(JSON.stringify(value));
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizeMessage(message) {
+  const blocks = normalizeMessageContent(message?.content);
+  return {
+    role: message?.role ?? 'unknown',
+    blockCount: blocks.length,
+    preview: blocks.map((block) => {
+      if (block?.type === 'text') {
+        return `text:${previewText(block.text ?? '')}`;
+      }
+      if (block?.type === 'tool_use') {
+        return `tool_use:${block.name ?? 'unknown'}:${summarizeMessageValue(block.input ?? {})}`;
+      }
+      if (block?.type === 'tool_result') {
+        return `tool_result:${block.tool_use_id ?? 'unknown'}:${summarizeMessageValue(block.content ?? '')}`;
+      }
+      if (block?.type === 'image') {
+        return `image:${block.source?.type ?? 'unknown'}`;
+      }
+      return `${block?.type ?? typeof block}:${summarizeMessageValue(block)}`;
+    }).join(' | ')
+  };
+}
+
+function summarizeMessagesDiff(previousMessages, currentMessages) {
+  if (!Array.isArray(previousMessages) || !Array.isArray(currentMessages)) {
+    return null;
+  }
+  const sharedCount = Math.min(previousMessages.length, currentMessages.length);
+  for (let index = 0; index < sharedCount; index += 1) {
+    if (JSON.stringify(previousMessages[index]) !== JSON.stringify(currentMessages[index])) {
+      return {
+        mismatchIndex: index,
+        previousLength: previousMessages.length,
+        currentLength: currentMessages.length,
+        previousMessage: summarizeMessage(previousMessages[index]),
+        currentMessage: summarizeMessage(currentMessages[index])
+      };
+    }
+  }
+  return {
+    mismatchIndex: sharedCount,
+    previousLength: previousMessages.length,
+    currentLength: currentMessages.length,
+    previousMessage: previousMessages[sharedCount] ? summarizeMessage(previousMessages[sharedCount]) : null,
+    currentMessage: currentMessages[sharedCount] ? summarizeMessage(currentMessages[sharedCount]) : null
   };
 }
 
@@ -427,6 +520,17 @@ function summarizeAnthropicMessages(messages) {
   });
 }
 
+function createBranchFingerprint(messages) {
+  if (!Array.isArray(messages)) {
+    return 'none';
+  }
+  const firstUserMessage = messages.find((message) => message?.role === 'user');
+  if (!firstUserMessage) {
+    return 'none';
+  }
+  return stableHash(JSON.stringify(firstUserMessage));
+}
+
 function convertTools(tools) {
   if (!tools) {
     return [];
@@ -523,13 +627,43 @@ function getSessionSnapshot(sessionKey) {
   return sessionState.get(sessionKey) ?? null;
 }
 
+function getOrCreateSessionEntry(sessionKey) {
+  if (!sessionKey) {
+    return null;
+  }
+  const existing = sessionState.get(sessionKey);
+  if (existing) {
+    return existing;
+  }
+  const created = {
+    degradedToHttp: false,
+    ws: null,
+    wsOpenPromise: null,
+    activeResponseDone: null,
+    requestQueue: Promise.resolve(),
+    lastResponseId: null,
+    system: '',
+    toolsKey: '[]',
+    systemHash: stableHash(''),
+    toolsHash: stableHash('[]'),
+    messages: []
+  };
+  sessionState.set(sessionKey, created);
+  return created;
+}
+
+function createWebSocketUrl() {
+  return `${UPSTREAM_BASE_URL.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')}/responses`;
+}
+
 function createSessionBucketKey(body, context) {
   if (!context.claudeSessionId) {
     return null;
   }
   return JSON.stringify({
     claudeSessionId: context.claudeSessionId,
-    model: mapModel(body.model)
+    model: mapModel(body.model),
+    branch: createBranchFingerprint(body.messages)
   });
 }
 
@@ -554,7 +688,8 @@ function createContinuationRequest(body, context, fullRequest) {
     toolsHash: stableHash(toolsKey),
     snapshotSystemHash: snapshot?.systemHash ?? null,
     snapshotToolsHash: snapshot?.toolsHash ?? null,
-    systemDiff: snapshot?.system ? summarizeSystemDiff(snapshot.system, system) : null
+    systemDiff: snapshot?.system ? summarizeSystemDiff(snapshot.system, system) : null,
+    messagesDiff: null
   };
   if (!snapshot?.lastResponseId) {
     return {
@@ -579,6 +714,7 @@ function createContinuationRequest(body, context, fullRequest) {
   }
   const currentMessages = Array.isArray(body.messages) ? body.messages : [];
   if (!messagesHavePrefix(snapshot.messages, currentMessages)) {
+    diagnostics.messagesDiff = summarizeMessagesDiff(snapshot.messages, currentMessages);
     return {
       request: fullRequest,
       fullRequest,
@@ -618,14 +754,13 @@ function rememberSessionResponse(claudeSessionId, body, responseId) {
   if (!sessionKey || !responseId) {
     return;
   }
-  sessionState.set(sessionKey, {
-    lastResponseId: responseId,
-    system: anthropicSystemToString(body.system),
-    toolsKey: JSON.stringify(body.tools ?? []),
-    systemHash: stableHash(anthropicSystemToString(body.system)),
-    toolsHash: stableHash(JSON.stringify(body.tools ?? [])),
-    messages: cloneJson(body.messages ?? [])
-  });
+  const entry = getOrCreateSessionEntry(sessionKey);
+  entry.lastResponseId = responseId;
+  entry.system = anthropicSystemToString(body.system);
+  entry.toolsKey = JSON.stringify(body.tools ?? []);
+  entry.systemHash = stableHash(entry.system);
+  entry.toolsHash = stableHash(entry.toolsKey);
+  entry.messages = cloneJson(body.messages ?? []);
 }
 
 function shouldRetryWithoutPreviousResponse(status, text) {
@@ -665,6 +800,289 @@ function buildResponsesInputTokensRequest(body, context = {}) {
     reasoning: request.reasoning,
     prompt_cache_key: request.prompt_cache_key
   };
+}
+
+function buildUpstreamWebSocketHeaders(auth, upstreamSessionId) {
+  return {
+    authorization: `Bearer ${auth.tokens.access_token}`,
+    ...(auth.tokens.account_id ? { 'ChatGPT-Account-ID': auth.tokens.account_id } : {}),
+    ...(upstreamSessionId ? { session_id: upstreamSessionId, 'x-client-request-id': upstreamSessionId } : {}),
+    [OPENAI_BETA_HEADER]: RESPONSES_WS_BETA_HEADER
+  };
+}
+
+function getUpstreamSessionId(sessionKey, context) {
+  if (!sessionKey) {
+    return null;
+  }
+  if (context.claudeSessionId) {
+    return `claude-${stableHash(sessionKey)}-${context.claudeSessionId}`;
+  }
+  return `proxy-${stableHash(sessionKey)}`;
+}
+
+function closeEntryWebSocket(entry) {
+  if (!entry?.ws) {
+    return;
+  }
+  const ws = entry.ws;
+  entry.ws = null;
+  entry.wsOpenPromise = null;
+  entry.activeResponseDone = null;
+  try {
+    ws.removeAllListeners();
+    ws.close();
+  } catch {
+    // Ignore close errors during cleanup.
+  }
+}
+
+function markSessionHttpFallback(entry, reason) {
+  if (!entry) {
+    return;
+  }
+  if (!entry.degradedToHttp) {
+    log('upstream websocket degraded to http', reason);
+  }
+  entry.degradedToHttp = true;
+  closeEntryWebSocket(entry);
+}
+
+function isPreviousResponseNotFoundPayload(payload) {
+  const code = payload?.error?.code;
+  const message = payload?.error?.message ?? payload?.message ?? '';
+  return code === 'previous_response_not_found'
+    || String(message).includes('previous_response_not_found')
+    || String(message).includes('previous response');
+}
+
+async function waitForActiveResponse(entry) {
+  if (!entry?.activeResponseDone) {
+    return;
+  }
+  try {
+    await entry.activeResponseDone;
+  } catch {
+    // Ignore stale response completion failures before starting a new turn.
+  }
+}
+
+async function runEntryExclusive(entry, operation) {
+  const previous = entry.requestQueue ?? Promise.resolve();
+  let release;
+  entry.requestQueue = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+async function connectUpstreamWebSocket(entry, auth, context, sessionKey) {
+  if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
+    return entry.ws;
+  }
+  if (entry.wsOpenPromise) {
+    return entry.wsOpenPromise;
+  }
+
+  const wsUrl = createWebSocketUrl();
+  const upstreamSessionId = getUpstreamSessionId(sessionKey, context);
+  entry.wsOpenPromise = new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl, {
+      headers: buildUpstreamWebSocketHeaders(auth, upstreamSessionId),
+      handshakeTimeout: UPSTREAM_WS_CONNECT_TIMEOUT_MS,
+      perMessageDeflate: true
+    });
+
+    const cleanup = () => {
+      ws.off('open', handleOpen);
+      ws.off('unexpected-response', handleUnexpectedResponse);
+      ws.off('error', handleError);
+      ws.off('close', handleClose);
+    };
+
+    const fail = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    const handleOpen = () => {
+      cleanup();
+      entry.ws = ws;
+      resolve(ws);
+    };
+
+    const handleUnexpectedResponse = (_req, response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        body += chunk;
+      });
+      response.on('end', () => {
+        fail(new UpstreamWebSocketFallbackError(`Upstream websocket upgrade failed with ${response.statusCode}: ${body}`));
+      });
+    };
+
+    const handleError = (error) => {
+      fail(new UpstreamWebSocketFallbackError(`Upstream websocket connect failed: ${error.message}`));
+    };
+
+    const handleClose = (code, reason) => {
+      fail(new UpstreamWebSocketFallbackError(`Upstream websocket closed during connect (${code}): ${String(reason || '')}`));
+    };
+
+    ws.once('open', handleOpen);
+    ws.once('unexpected-response', handleUnexpectedResponse);
+    ws.once('error', handleError);
+    ws.once('close', handleClose);
+  }).finally(() => {
+    entry.wsOpenPromise = null;
+  });
+
+  return entry.wsOpenPromise;
+}
+
+async function callCodexResponsesViaWebSocket(requestBody, auth, context, entry, sessionKey) {
+  await waitForActiveResponse(entry);
+  const ws = await connectUpstreamWebSocket(entry, auth, context, sessionKey);
+  log(
+    'upstream websocket request',
+    '/responses',
+    'model=',
+    requestBody.model,
+    'items=',
+    requestBody.input.length,
+    'tools=',
+    requestBody.tools.length
+  );
+
+  const encoder = new TextEncoder();
+  let completed = false;
+  let firstEventSeen = false;
+  let idleTimer = null;
+  let resolveFirstEvent;
+  let rejectFirstEvent;
+  let resolveDone;
+  let rejectDone;
+  const firstEventReady = new Promise((resolve, reject) => {
+    resolveFirstEvent = resolve;
+    rejectFirstEvent = reject;
+  });
+  const responseDone = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+
+  const resetIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      handleFatalError(new UpstreamWebSocketFallbackError('Upstream websocket idle timeout'));
+    }, UPSTREAM_WS_IDLE_TIMEOUT_MS);
+  };
+
+  const stream = new ReadableStream({
+    start(controller) {
+      function cleanup() {
+        clearTimeout(idleTimer);
+        ws.off('message', handleMessage);
+        ws.off('error', handleError);
+        ws.off('close', handleClose);
+      }
+
+      function handleFatalError(error, degrade = false) {
+        cleanup();
+        if (degrade) {
+          markSessionHttpFallback(entry, error.message);
+        }
+        if (!firstEventSeen) {
+          rejectFirstEvent(error);
+        }
+        rejectDone(error);
+        controller.error(error);
+      }
+
+      function finish() {
+        cleanup();
+        completed = true;
+        resolveDone();
+        controller.close();
+      }
+
+      function handleMessage(raw) {
+        resetIdleTimer();
+        const text = typeof raw === 'string' ? raw : raw.toString('utf8');
+        let payload;
+        try {
+          payload = JSON.parse(text);
+        } catch (error) {
+          handleFatalError(new UpstreamWebSocketFallbackError(`Invalid upstream websocket payload: ${error.message}`), true);
+          return;
+        }
+
+        if (payload?.type === 'error') {
+          const error = isPreviousResponseNotFoundPayload(payload)
+            ? new UpstreamPreviousResponseNotFoundError(payload.error?.message ?? 'previous_response_not_found')
+            : new UpstreamWebSocketFallbackError(payload.error?.message ?? 'Upstream websocket error');
+          handleFatalError(error, !(error instanceof UpstreamPreviousResponseNotFoundError));
+          return;
+        }
+
+        firstEventSeen = true;
+        resolveFirstEvent();
+        controller.enqueue(encoder.encode(`event: message\ndata: ${JSON.stringify(payload)}\n\n`));
+        if (payload.type === 'response.completed' || payload.type === 'response.failed' || payload.type === 'response.incomplete') {
+          finish();
+        }
+      }
+
+      function handleError(error) {
+        handleFatalError(new UpstreamWebSocketFallbackError(`Upstream websocket stream failed: ${error.message}`), true);
+      }
+
+      function handleClose(code, reason) {
+        const error = new UpstreamWebSocketFallbackError(`Upstream websocket closed (${code}): ${String(reason || '')}`);
+        if (!completed) {
+          handleFatalError(error, true);
+        }
+      }
+
+      ws.on('message', handleMessage);
+      ws.once('error', handleError);
+      ws.once('close', handleClose);
+      resetIdleTimer();
+    }
+  });
+
+  entry.activeResponseDone = responseDone.finally(() => {
+    if (entry.activeResponseDone === responseDone) {
+      entry.activeResponseDone = null;
+    }
+  });
+
+  const wsPayload = {
+    type: 'response.create',
+    ...requestBody
+  };
+  await new Promise((resolve, reject) => {
+    ws.send(JSON.stringify(wsPayload), (error) => {
+      if (error) {
+        reject(new UpstreamWebSocketFallbackError(`Upstream websocket send failed: ${error.message}`));
+      } else {
+        resolve();
+      }
+    });
+  }).catch((error) => {
+    markSessionHttpFallback(entry, error.message);
+    throw error;
+  });
+
+  await firstEventReady;
+  log('upstream websocket response accepted');
+  return { body: stream, transport: 'websocket' };
 }
 
 async function callCodexResponses(requestBody, auth, retryOnUnauthorized = true) {
@@ -717,8 +1135,10 @@ async function callCodexInputTokens(requestBody, auth, retryOnUnauthorized = tru
 
   if (!response.ok) {
     const text = await response.text();
-    log('upstream input_tokens error', response.status, text.slice(0, 300));
-    throw new Error(`Upstream /responses/input_tokens failed with ${response.status}: ${text}`);
+    const contentType = response.headers.get('content-type') ?? 'unknown';
+    const summary = summarizeErrorBody(text);
+    log('upstream input_tokens error', response.status, 'content-type=', contentType, 'body=', summary);
+    throw new Error(`Upstream /responses/input_tokens failed with ${response.status} (${contentType}): ${summary}`);
   }
 
   const payload = await response.json();
@@ -735,16 +1155,38 @@ function shouldFallbackCountTokens(error) {
     || message.includes('<html');
 }
 
-async function callCodexResponsesWithFallback(preparedRequest, auth) {
-  try {
-    return await callCodexResponses(preparedRequest.request, auth, true);
-  } catch (error) {
-    if (!preparedRequest.usedContinuation || !shouldRetryWithoutPreviousResponse(500, error.message ?? '')) {
-      throw error;
+async function callCodexResponsesWithFallback(preparedRequest, auth, context = {}) {
+  const sessionKey = preparedRequest.diagnostics?.sessionBucketKey ?? createSessionBucketKey({
+    model: preparedRequest.request.model,
+    messages: []
+  }, context);
+  const entry = getOrCreateSessionEntry(sessionKey);
+  const websocketEligible = UPSTREAM_WS_ENABLED && sessionKey && entry && !entry.degradedToHttp;
+  const execute = async () => {
+    try {
+      if (websocketEligible) {
+        return await callCodexResponsesViaWebSocket(preparedRequest.request, auth, context, entry, sessionKey);
+      }
+      return await callCodexResponses(preparedRequest.request, auth, true);
+    } catch (error) {
+      if (error instanceof UpstreamWebSocketFallbackError) {
+        markSessionHttpFallback(entry, error.message);
+        return callCodexResponses(preparedRequest.request, auth, true);
+      }
+      if (!preparedRequest.usedContinuation || !shouldRetryWithoutPreviousResponse(500, error.message ?? '')) {
+        throw error;
+      }
+      log('continuation request failed, retrying with full context');
+      if (error instanceof UpstreamPreviousResponseNotFoundError && websocketEligible && entry && !entry.degradedToHttp) {
+        return callCodexResponsesViaWebSocket(preparedRequest.fullRequest, auth, context, entry, sessionKey);
+      }
+      return callCodexResponses(preparedRequest.fullRequest, auth, true);
     }
-    log('continuation request failed, retrying with full context');
-    return callCodexResponses(preparedRequest.fullRequest, auth, true);
+  };
+  if (entry) {
+    return runEntryExclusive(entry, execute);
   }
+  return execute();
 }
 
 async function callCodexInputTokensWithFallback(preparedRequest, auth) {
@@ -1084,6 +1526,8 @@ async function handleCountTokens(req, res, context) {
       preparedRequest.diagnostics.snapshotToolsHash ?? 'none',
       'system_diff=',
       preparedRequest.diagnostics.systemDiff ? JSON.stringify(preparedRequest.diagnostics.systemDiff) : 'none',
+      'messages_diff=',
+      preparedRequest.diagnostics.messagesDiff ? JSON.stringify(preparedRequest.diagnostics.messagesDiff) : 'none',
       'previous_response_id=',
       preparedRequest.request.previous_response_id ?? 'none',
       'delta_messages=',
@@ -1128,12 +1572,14 @@ async function handleMessages(req, res, context) {
       preparedRequest.diagnostics.snapshotToolsHash ?? 'none',
       'system_diff=',
       preparedRequest.diagnostics.systemDiff ? JSON.stringify(preparedRequest.diagnostics.systemDiff) : 'none',
+      'messages_diff=',
+      preparedRequest.diagnostics.messagesDiff ? JSON.stringify(preparedRequest.diagnostics.messagesDiff) : 'none',
       'previous_response_id=',
       responsesRequest.previous_response_id ?? 'none',
       'delta_messages=',
       preparedRequest.deltaMessageCount ?? 0
     );
-    const upstream = await callCodexResponsesWithFallback(preparedRequest, auth);
+    const upstream = await callCodexResponsesWithFallback(preparedRequest, auth, context);
     if (body.stream === false) {
       const result = await collectAnthropicResponse(upstream, body.model ?? 'claude-sonnet-4-5');
       rememberSessionResponse(context.claudeSessionId, body, result.responseId);
@@ -1227,6 +1673,9 @@ export function startServer() {
 }
 
 export function resetSessionState() {
+  for (const entry of sessionState.values()) {
+    closeEntryWebSocket(entry);
+  }
   sessionState.clear();
 }
 
@@ -1239,10 +1688,14 @@ export {
   AUTH_FILE,
   buildResponsesRequest,
   buildResponsesInputTokensRequest,
+  buildUpstreamWebSocketHeaders,
   callCodexResponsesWithFallback,
+  createWebSocketUrl,
   createContinuationRequest,
   DEFAULT_AUTH_FILE,
   estimateInputTokens,
+  getUpstreamSessionId,
+  isPreviousResponseNotFoundPayload,
   parseRequestContext,
   requireAnthropicHeaders,
   rememberSessionResponse,
