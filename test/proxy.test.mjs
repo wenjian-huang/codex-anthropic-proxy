@@ -77,6 +77,19 @@ test('`buildResponsesRequest` keeps assistant history as `output_text`', () => {
     role: 'assistant',
     content: [{ type: 'output_text', text: 'world' }]
   });
+  assert.equal(request.prompt_cache_key, undefined);
+});
+
+test('`buildResponsesRequest` uses Claude session id as prompt_cache_key', () => {
+  const request = buildResponsesRequest(
+    {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hello' }]
+    },
+    { claudeSessionId: 'session-123' }
+  );
+
+  assert.equal(request.prompt_cache_key, 'session-123');
 });
 
 test('`estimateInputTokens` counts text, system and tools', () => {

@@ -31,15 +31,19 @@ function createRequestId() {
   return `req_${randomUUID().replace(/-/g, '')}`;
 }
 
+function logPrefix() {
+  return `[proxy ${new Date().toISOString()}]`;
+}
+
 function log(...args) {
   if (VERBOSE) {
-    console.error('[proxy]', ...args);
+    console.error(logPrefix(), ...args);
   }
 }
 
 function debugLog(...args) {
   if (DEBUG) {
-    console.error('[proxy]', ...args);
+    console.error(logPrefix(), ...args);
   }
 }
 
@@ -390,7 +394,7 @@ function estimateInputTokens(body) {
   return Math.max(1, Math.ceil(totalChars / 4));
 }
 
-function buildResponsesRequest(body) {
+function buildResponsesRequest(body, context = {}) {
   return {
     model: mapModel(body.model),
     instructions: anthropicSystemToString(body.system),
@@ -402,7 +406,7 @@ function buildResponsesRequest(body) {
     store: false,
     stream: true,
     include: [],
-    prompt_cache_key: `anthropic-proxy:${Date.now()}`
+    prompt_cache_key: context.claudeSessionId ?? undefined
   };
 }
 
@@ -709,7 +713,7 @@ async function handleMessages(req, res, context) {
     requireAnthropicHeaders(context);
     const body = await readJsonBody(req);
     const auth = await refreshAuthIfNeeded(false);
-    const responsesRequest = buildResponsesRequest(body);
+    const responsesRequest = buildResponsesRequest(body, context);
     log('messages request', context.requestId, 'headers=', JSON.stringify(summarizeHeaders(context)));
     debugLog('anthropic messages', JSON.stringify(summarizeAnthropicMessages(body.messages)));
     log('request model', body.model, 'mapped to', responsesRequest.model, 'stream=', body.stream !== false);
