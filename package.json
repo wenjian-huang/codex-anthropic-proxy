@@ -1,0 +1,14 @@
+{
+  "name": "codex-anthropic-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Anthropic Messages API compatible proxy backed by Codex/OpenAI Responses auth from ~/.codex/auth.json",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test",
+    "smoke:curl": "bash scripts/smoke-curl.sh",
+    "smoke:claude": "bash scripts/smoke-claude.sh",
+    "smoke:claude:multiturn": "bash scripts/smoke-claude-multiturn.sh"
+  }
+}
