@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFile, rename, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -24,6 +24,7 @@ const MODEL_MAP = {
 };
 
 let refreshInFlight = null;
+const sessionState = new Map();
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' };
 const ANTHROPIC_VERSION_HEADER = 'anthropic-version';
 
@@ -55,6 +56,85 @@ function summarizeHeaders(context) {
     userAgent: context.userAgent ?? null,
     hasAuthToken: Boolean(context.authToken)
   };
+}
+
+function cloneJson(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function extractCachedInputTokens(usage) {
+  return usage?.input_tokens_details?.cached_tokens
+    ?? usage?.cached_input_tokens
+    ?? 0;
+}
+
+function stableHash(value) {
+  return createHash('sha1').update(value).digest('hex').slice(0, 10);
+}
+
+function previewText(value, maxLength = 80) {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength)}...`;
+}
+
+function countSharedPrefix(a, b) {
+  const max = Math.min(a.length, b.length);
+  let index = 0;
+  while (index < max && a[index] === b[index]) {
+    index += 1;
+  }
+  return index;
+}
+
+function countSharedSuffix(a, b, prefixLength = 0) {
+  const max = Math.min(a.length, b.length) - prefixLength;
+  let count = 0;
+  while (count < max && a[a.length - 1 - count] === b[b.length - 1 - count]) {
+    count += 1;
+  }
+  return count;
+}
+
+function summarizeSystemDiff(previousSystem, currentSystem) {
+  const sharedPrefixLength = countSharedPrefix(previousSystem, currentSystem);
+  const sharedSuffixLength = countSharedSuffix(previousSystem, currentSystem, sharedPrefixLength);
+  const previousMiddle = previousSystem.slice(
+    sharedPrefixLength,
+    Math.max(sharedPrefixLength, previousSystem.length - sharedSuffixLength)
+  );
+  const currentMiddle = currentSystem.slice(
+    sharedPrefixLength,
+    Math.max(sharedPrefixLength, currentSystem.length - sharedSuffixLength)
+  );
+  return {
+    previousLength: previousSystem.length,
+    currentLength: currentSystem.length,
+    sharedPrefixLength,
+    sharedSuffixLength,
+    previousMiddleLength: previousMiddle.length,
+    currentMiddleLength: currentMiddle.length,
+    previousPreview: previewText(previousMiddle),
+    currentPreview: previewText(currentMiddle)
+  };
+}
+
+function canIgnoreSystemDiff(systemDiff) {
+  if (!systemDiff) {
+    return false;
+  }
+  if (systemDiff.previousLength !== systemDiff.currentLength) {
+    return false;
+  }
+  const sharedTotal = systemDiff.sharedPrefixLength + systemDiff.sharedSuffixLength;
+  const minLength = Math.min(systemDiff.previousLength, systemDiff.currentLength);
+  const sharedRatio = minLength === 0 ? 1 : sharedTotal / minLength;
+  return systemDiff.previousMiddleLength > 0
+    && systemDiff.previousMiddleLength <= 8
+    && systemDiff.previousMiddleLength === systemDiff.currentMiddleLength
+    && sharedRatio >= 0.99;
 }
 
 function sendJson(res, status, payload, headers = {}) {
@@ -230,6 +310,37 @@ function convertTextBlock(role, text) {
   };
 }
 
+function imageBlockToImageUrl(block) {
+  const source = block?.source;
+  if (!source || typeof source !== 'object') {
+    throw new Error('Image block must include a source object');
+  }
+  if (source.type === 'url') {
+    if (typeof source.url !== 'string' || !source.url) {
+      throw new Error('Image URL source must include a non-empty url');
+    }
+    return source.url;
+  }
+  if (source.type === 'base64') {
+    if (typeof source.media_type !== 'string' || !source.media_type) {
+      throw new Error('Base64 image source must include media_type');
+    }
+    if (typeof source.data !== 'string' || !source.data) {
+      throw new Error('Base64 image source must include data');
+    }
+    return `data:${source.media_type};base64,${source.data}`;
+  }
+  throw new Error(`Unsupported image source type: ${source.type ?? typeof source}`);
+}
+
+function convertImageBlock(block) {
+  return {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_image', image_url: imageBlockToImageUrl(block) }]
+  };
+}
+
 function convertToolUseBlock(block) {
   return {
     type: 'function_call',
@@ -266,6 +377,10 @@ function anthropicMessagesToResponsesInput(messages) {
         input.push(convertTextBlock(message.role, block.text ?? ''));
         continue;
       }
+      if (message.role === 'user' && block?.type === 'image') {
+        input.push(convertImageBlock(block));
+        continue;
+      }
       if (message.role === 'assistant' && block?.type === 'tool_use') {
         input.push(convertToolUseBlock(block));
         continue;
@@ -294,6 +409,9 @@ function summarizeAnthropicMessages(messages) {
         .map((block) => {
           if (block?.type === 'text') {
             return block.text ?? '';
+          }
+          if (block?.type === 'image') {
+            return `<image:${block.source?.type ?? 'unknown'}>`;
           }
           if (block?.type === 'tool_use') {
             return `<tool_use:${block.name ?? 'unknown'}>`;
@@ -371,6 +489,10 @@ function estimateInputTokens(body) {
         pushText(block.text ?? '');
         continue;
       }
+      if (block?.type === 'image') {
+        pushText(imageBlockToImageUrl(block));
+        continue;
+      }
       if (block?.type === 'tool_use') {
         pushText(block.name ?? '');
         pushText(JSON.stringify(block.input ?? {}));
@@ -394,6 +516,127 @@ function estimateInputTokens(body) {
   return Math.max(1, Math.ceil(totalChars / 4));
 }
 
+function getSessionSnapshot(sessionKey) {
+  if (!sessionKey) {
+    return null;
+  }
+  return sessionState.get(sessionKey) ?? null;
+}
+
+function createSessionBucketKey(body, context) {
+  if (!context.claudeSessionId) {
+    return null;
+  }
+  return JSON.stringify({
+    claudeSessionId: context.claudeSessionId,
+    model: mapModel(body.model)
+  });
+}
+
+function messagesHavePrefix(previousMessages, nextMessages) {
+  if (!Array.isArray(previousMessages) || !Array.isArray(nextMessages)) {
+    return false;
+  }
+  if (previousMessages.length > nextMessages.length) {
+    return false;
+  }
+  return previousMessages.every((message, index) => JSON.stringify(message) === JSON.stringify(nextMessages[index]));
+}
+
+function createContinuationRequest(body, context, fullRequest) {
+  const sessionKey = createSessionBucketKey(body, context);
+  const snapshot = getSessionSnapshot(sessionKey);
+  const system = anthropicSystemToString(body.system);
+  const toolsKey = JSON.stringify(body.tools ?? []);
+  const diagnostics = {
+    sessionBucketKey: sessionKey,
+    systemHash: stableHash(system),
+    toolsHash: stableHash(toolsKey),
+    snapshotSystemHash: snapshot?.systemHash ?? null,
+    snapshotToolsHash: snapshot?.toolsHash ?? null,
+    systemDiff: snapshot?.system ? summarizeSystemDiff(snapshot.system, system) : null
+  };
+  if (!snapshot?.lastResponseId) {
+    return {
+      request: fullRequest,
+      fullRequest,
+      usedContinuation: false,
+      deltaMessageCount: 0,
+      continuationReason: 'no_snapshot',
+      diagnostics
+    };
+  }
+  const systemMatches = snapshot.system === system || canIgnoreSystemDiff(diagnostics.systemDiff);
+  if (!systemMatches || snapshot.toolsKey !== toolsKey) {
+    return {
+      request: fullRequest,
+      fullRequest,
+      usedContinuation: false,
+      deltaMessageCount: 0,
+      continuationReason: !systemMatches ? 'system_mismatch' : 'tools_mismatch',
+      diagnostics
+    };
+  }
+  const currentMessages = Array.isArray(body.messages) ? body.messages : [];
+  if (!messagesHavePrefix(snapshot.messages, currentMessages)) {
+    return {
+      request: fullRequest,
+      fullRequest,
+      usedContinuation: false,
+      deltaMessageCount: 0,
+      continuationReason: 'messages_prefix_mismatch',
+      diagnostics
+    };
+  }
+  const deltaMessages = currentMessages.slice(snapshot.messages.length);
+  if (deltaMessages.length === 0) {
+    return {
+      request: fullRequest,
+      fullRequest,
+      usedContinuation: false,
+      deltaMessageCount: 0,
+      continuationReason: 'empty_delta',
+      diagnostics
+    };
+  }
+  return {
+    request: {
+      ...fullRequest,
+      input: anthropicMessagesToResponsesInput(deltaMessages),
+      previous_response_id: snapshot.lastResponseId
+    },
+    fullRequest,
+    usedContinuation: true,
+    deltaMessageCount: deltaMessages.length,
+    continuationReason: 'continued',
+    diagnostics
+  };
+}
+
+function rememberSessionResponse(claudeSessionId, body, responseId) {
+  const sessionKey = createSessionBucketKey(body, { claudeSessionId });
+  if (!sessionKey || !responseId) {
+    return;
+  }
+  sessionState.set(sessionKey, {
+    lastResponseId: responseId,
+    system: anthropicSystemToString(body.system),
+    toolsKey: JSON.stringify(body.tools ?? []),
+    systemHash: stableHash(anthropicSystemToString(body.system)),
+    toolsHash: stableHash(JSON.stringify(body.tools ?? [])),
+    messages: cloneJson(body.messages ?? [])
+  });
+}
+
+function shouldRetryWithoutPreviousResponse(status, text) {
+  if (status < 400 || !text) {
+    return false;
+  }
+  return text.includes('previous_response_not_found')
+    || text.includes('previous_response_id')
+    || text.includes('previous response');
+}
+
 function buildResponsesRequest(body, context = {}) {
   return {
     model: mapModel(body.model),
@@ -407,6 +650,20 @@ function buildResponsesRequest(body, context = {}) {
     stream: true,
     include: [],
     prompt_cache_key: context.claudeSessionId ?? undefined
+  };
+}
+
+function buildResponsesInputTokensRequest(body, context = {}) {
+  const request = buildResponsesRequest(body, context);
+  return {
+    model: request.model,
+    instructions: request.instructions,
+    input: request.input,
+    tools: request.tools,
+    tool_choice: request.tool_choice,
+    parallel_tool_calls: request.parallel_tool_calls,
+    reasoning: request.reasoning,
+    prompt_cache_key: request.prompt_cache_key
   };
 }
 
@@ -437,6 +694,69 @@ async function callCodexResponses(requestBody, auth, retryOnUnauthorized = true)
 
   log('upstream response accepted', response.status);
   return response;
+}
+
+async function callCodexInputTokens(requestBody, auth, retryOnUnauthorized = true) {
+  log('upstream request', '/responses/input_tokens', 'model=', requestBody.model, 'items=', requestBody.input.length, 'tools=', requestBody.tools.length);
+  const response = await fetch(`${UPSTREAM_BASE_URL}/responses/input_tokens`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      authorization: `Bearer ${auth.tokens.access_token}`,
+      ...(auth.tokens.account_id ? { 'ChatGPT-Account-ID': auth.tokens.account_id } : {})
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  if (response.status === 401 && retryOnUnauthorized) {
+    log('upstream input_tokens 401, refreshing token and retrying once');
+    const refreshed = await refreshAuthIfNeeded(true);
+    return callCodexInputTokens(requestBody, refreshed, false);
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    log('upstream input_tokens error', response.status, text.slice(0, 300));
+    throw new Error(`Upstream /responses/input_tokens failed with ${response.status}: ${text}`);
+  }
+
+  const payload = await response.json();
+  log('upstream input_tokens accepted', response.status, 'input_tokens=', payload.input_tokens ?? 'missing');
+  return payload;
+}
+
+function shouldFallbackCountTokens(error) {
+  const message = error?.message ?? '';
+  return message.includes('/responses/input_tokens failed with 403')
+    || message.includes('/responses/input_tokens failed with 404')
+    || message.includes('/responses/input_tokens failed with 405')
+    || message.includes('/responses/input_tokens failed with 415')
+    || message.includes('<html');
+}
+
+async function callCodexResponsesWithFallback(preparedRequest, auth) {
+  try {
+    return await callCodexResponses(preparedRequest.request, auth, true);
+  } catch (error) {
+    if (!preparedRequest.usedContinuation || !shouldRetryWithoutPreviousResponse(500, error.message ?? '')) {
+      throw error;
+    }
+    log('continuation request failed, retrying with full context');
+    return callCodexResponses(preparedRequest.fullRequest, auth, true);
+  }
+}
+
+async function callCodexInputTokensWithFallback(preparedRequest, auth) {
+  try {
+    return await callCodexInputTokens(preparedRequest.request, auth, true);
+  } catch (error) {
+    if (!preparedRequest.usedContinuation || !shouldRetryWithoutPreviousResponse(500, error.message ?? '')) {
+      throw error;
+    }
+    log('continuation input_tokens failed, retrying with full context');
+    return callCodexInputTokens(preparedRequest.fullRequest, auth, true);
+  }
 }
 
 async function* parseSse(stream) {
@@ -500,13 +820,15 @@ async function streamAnthropicResponse(res, upstream, requestedModel, requestId)
 
   const state = {
     message: anthropicMessageEnvelope(requestedModel),
+    responseId: null,
     textBlockOpen: false,
     sawToolUse: false,
     currentThinkingIndex: null,
     currentTextIndex: 0,
     aggregatedText: '',
     blocks: [],
-    usage: { input_tokens: 0, output_tokens: 0 }
+    usage: { input_tokens: 0, output_tokens: 0 },
+    cachedInputTokens: 0
   };
   const pingTimer = setInterval(() => writeAnthropicPing(res), 10000);
 
@@ -533,6 +855,13 @@ async function streamAnthropicResponse(res, upstream, requestedModel, requestId)
           error: payload.error ?? { type: 'api_error', message: 'Upstream SSE error' }
         });
         break;
+      }
+      if (payload.type === 'response.created' || payload.type === 'response.in_progress') {
+        const responseId = payload.response?.id;
+        if (typeof responseId === 'string' && responseId) {
+          state.responseId = responseId;
+        }
+        continue;
       }
       if (payload.type === 'response.reasoning_text.delta') {
         if (state.currentThinkingIndex === null) {
@@ -616,10 +945,16 @@ async function streamAnthropicResponse(res, upstream, requestedModel, requestId)
         continue;
       }
       if (payload.type === 'response.completed') {
+        const responseId = payload.response?.id;
+        if (typeof responseId === 'string' && responseId) {
+          state.responseId = responseId;
+        }
+        const usage = payload.response?.usage ?? payload.usage ?? {};
         state.usage = {
-          input_tokens: payload.response?.usage?.input_tokens ?? payload.usage?.input_tokens ?? 0,
-          output_tokens: payload.response?.usage?.output_tokens ?? payload.usage?.output_tokens ?? 0
+          input_tokens: usage.input_tokens ?? 0,
+          output_tokens: usage.output_tokens ?? 0
         };
+        state.cachedInputTokens = extractCachedInputTokens(usage);
       }
     }
 
@@ -636,6 +971,7 @@ async function streamAnthropicResponse(res, upstream, requestedModel, requestId)
     });
     writeSse(res, { type: 'message_stop' });
     res.end();
+    return { responseId: state.responseId, usage: state.usage, cachedInputTokens: state.cachedInputTokens };
   } finally {
     clearInterval(pingTimer);
   }
@@ -653,11 +989,19 @@ async function collectAnthropicResponse(upstream, requestedModel) {
     usage: { input_tokens: 0, output_tokens: 0 }
   };
   let text = '';
+  let responseId = null;
+  let cachedInputTokens = 0;
   for await (const event of parseSse(upstream.body)) {
     if (event.data === '[DONE]') {
       continue;
     }
     const payload = JSON.parse(event.data);
+    if (payload.type === 'response.created' || payload.type === 'response.in_progress') {
+      const currentResponseId = payload.response?.id;
+      if (typeof currentResponseId === 'string' && currentResponseId) {
+        responseId = currentResponseId;
+      }
+    }
     if (payload.type === 'response.output_text.delta') {
       text += payload.delta ?? '';
     }
@@ -682,25 +1026,71 @@ async function collectAnthropicResponse(upstream, requestedModel) {
       }
     }
     if (payload.type === 'response.completed') {
+      const currentResponseId = payload.response?.id;
+      if (typeof currentResponseId === 'string' && currentResponseId) {
+        responseId = currentResponseId;
+      }
       const usage = payload.response?.usage ?? payload.usage ?? {};
       result.usage = {
         input_tokens: usage.input_tokens ?? 0,
         output_tokens: usage.output_tokens ?? 0
       };
+      cachedInputTokens = extractCachedInputTokens(usage);
     }
   }
   if (text) {
     result.content.unshift({ type: 'text', text });
   }
-  return result;
+  return { payload: result, responseId, cachedInputTokens };
 }
 
 async function handleCountTokens(req, res, context) {
   try {
     requireAnthropicHeaders(context);
     const body = await readJsonBody(req);
-    const inputTokens = estimateInputTokens(body);
-    log('count_tokens request', context.requestId, 'tokens=', inputTokens, 'headers=', JSON.stringify(summarizeHeaders(context)));
+    const auth = await refreshAuthIfNeeded(false);
+    const preparedRequest = createContinuationRequest(body, context, buildResponsesInputTokensRequest(body, context));
+    let inputTokens;
+    let mode = 'upstream';
+    try {
+      const payload = await callCodexInputTokensWithFallback(preparedRequest, auth);
+      inputTokens = payload.input_tokens;
+    } catch (error) {
+      if (!shouldFallbackCountTokens(error)) {
+        throw error;
+      }
+      mode = 'fallback_estimate';
+      inputTokens = estimateInputTokens(body);
+      log('count_tokens fallback to estimate', context.requestId, error.message);
+    }
+    log(
+      'count_tokens request',
+      context.requestId,
+      'tokens=',
+      inputTokens,
+      'mode=',
+      mode,
+      'continuation=',
+      preparedRequest.usedContinuation,
+      'reason=',
+      preparedRequest.continuationReason,
+      'system_hash=',
+      preparedRequest.diagnostics.systemHash,
+      'tools_hash=',
+      preparedRequest.diagnostics.toolsHash,
+      'snapshot_system_hash=',
+      preparedRequest.diagnostics.snapshotSystemHash ?? 'none',
+      'snapshot_tools_hash=',
+      preparedRequest.diagnostics.snapshotToolsHash ?? 'none',
+      'system_diff=',
+      preparedRequest.diagnostics.systemDiff ? JSON.stringify(preparedRequest.diagnostics.systemDiff) : 'none',
+      'previous_response_id=',
+      preparedRequest.request.previous_response_id ?? 'none',
+      'delta_messages=',
+      preparedRequest.deltaMessageCount ?? 0,
+      'headers=',
+      JSON.stringify(summarizeHeaders(context))
+    );
     sendJson(res, 200, { input_tokens: inputTokens }, { 'request-id': context.requestId });
   } catch (error) {
     log('count_tokens failed', context.requestId, error.message);
@@ -713,19 +1103,70 @@ async function handleMessages(req, res, context) {
     requireAnthropicHeaders(context);
     const body = await readJsonBody(req);
     const auth = await refreshAuthIfNeeded(false);
-    const responsesRequest = buildResponsesRequest(body, context);
+    const preparedRequest = createContinuationRequest(body, context, buildResponsesRequest(body, context));
+    const responsesRequest = preparedRequest.request;
     log('messages request', context.requestId, 'headers=', JSON.stringify(summarizeHeaders(context)));
     debugLog('anthropic messages', JSON.stringify(summarizeAnthropicMessages(body.messages)));
-    log('request model', body.model, 'mapped to', responsesRequest.model, 'stream=', body.stream !== false);
-    const upstream = await callCodexResponses(responsesRequest, auth, true);
+    log(
+      'request model',
+      body.model,
+      'mapped to',
+      responsesRequest.model,
+      'stream=',
+      body.stream !== false,
+      'continuation=',
+      preparedRequest.usedContinuation,
+      'reason=',
+      preparedRequest.continuationReason,
+      'system_hash=',
+      preparedRequest.diagnostics.systemHash,
+      'tools_hash=',
+      preparedRequest.diagnostics.toolsHash,
+      'snapshot_system_hash=',
+      preparedRequest.diagnostics.snapshotSystemHash ?? 'none',
+      'snapshot_tools_hash=',
+      preparedRequest.diagnostics.snapshotToolsHash ?? 'none',
+      'system_diff=',
+      preparedRequest.diagnostics.systemDiff ? JSON.stringify(preparedRequest.diagnostics.systemDiff) : 'none',
+      'previous_response_id=',
+      responsesRequest.previous_response_id ?? 'none',
+      'delta_messages=',
+      preparedRequest.deltaMessageCount ?? 0
+    );
+    const upstream = await callCodexResponsesWithFallback(preparedRequest, auth);
     if (body.stream === false) {
-      const payload = await collectAnthropicResponse(upstream, body.model ?? 'claude-sonnet-4-5');
-      log('messages request completed', context.requestId, 'mode=json', 'stop_reason=', payload.stop_reason, 'output_tokens=', payload.usage.output_tokens);
+      const result = await collectAnthropicResponse(upstream, body.model ?? 'claude-sonnet-4-5');
+      rememberSessionResponse(context.claudeSessionId, body, result.responseId);
+      const payload = result.payload;
+      log(
+        'messages request completed',
+        context.requestId,
+        'mode=json',
+        'stop_reason=',
+        payload.stop_reason,
+        'input_tokens=',
+        payload.usage.input_tokens,
+        'cached_input_tokens=',
+        result.cachedInputTokens,
+        'output_tokens=',
+        payload.usage.output_tokens
+      );
       sendJson(res, 200, payload, { 'request-id': context.requestId });
       return;
     }
-    await streamAnthropicResponse(res, upstream, body.model ?? 'claude-sonnet-4-5', context.requestId);
-    log('messages request completed', context.requestId, 'mode=sse');
+    const result = await streamAnthropicResponse(res, upstream, body.model ?? 'claude-sonnet-4-5', context.requestId);
+    rememberSessionResponse(context.claudeSessionId, body, result?.responseId);
+    log(
+      'messages request completed',
+      context.requestId,
+      'mode=sse',
+      'input_tokens=',
+      result?.usage?.input_tokens ?? 0,
+      'cached_input_tokens=',
+      result?.cachedInputTokens ?? 0,
+      'output_tokens=',
+      result?.usage?.output_tokens ?? 0
+    );
   } catch (error) {
     log('request failed', context.requestId, error.stack ?? error.message);
     const status = error.message?.startsWith('Missing required header') ? 400 : 500;
@@ -785,6 +1226,10 @@ export function startServer() {
   });
 }
 
+export function resetSessionState() {
+  sessionState.clear();
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   startServer();
 }
@@ -793,9 +1238,13 @@ export {
   ANTHROPIC_VERSION_HEADER,
   AUTH_FILE,
   buildResponsesRequest,
+  buildResponsesInputTokensRequest,
+  callCodexResponsesWithFallback,
+  createContinuationRequest,
   DEFAULT_AUTH_FILE,
   estimateInputTokens,
   parseRequestContext,
   requireAnthropicHeaders,
+  rememberSessionResponse,
   streamAnthropicResponse
 };
