@@ -1,6 +1,6 @@
 # codex-anthropic-proxy
 
-本地 Anthropic Messages API 兼容代理，内部通过 `/Users/concefly/.codex/auth.json` 的 ChatGPT 登录态调用 Codex/OpenAI Responses 后端。
+本地 Anthropic Messages API 兼容代理，内部通过 Codex CLI 的 ChatGPT 登录态调用 Codex/OpenAI Responses 后端。
 
 当前已实现的兼容点：
 
@@ -13,11 +13,17 @@
 ## 运行
 
 ```bash
-cd /Users/concefly/Project/codex-anthropic-proxy
+cd codex-anthropic-proxy
 node src/index.mjs
 ```
 
 默认监听 `http://127.0.0.1:4141`。
+
+如果需要显式指定凭证文件，可以设置：
+
+```bash
+CODEX_AUTH_FILE=/path/to/.codex/auth.json node src/index.mjs
+```
 
 ## 验证
 
@@ -37,7 +43,7 @@ bash scripts/smoke-claude-multiturn.sh
 
 - `HOST`
 - `PORT`
-- `CODEX_AUTH_FILE`
+- `CODEX_AUTH_FILE`：可选，指定 Codex 登录凭证文件位置
 - `CODEX_UPSTREAM_BASE_URL`
 - `CODEX_REFRESH_URL`
 - `ANTHROPIC_BASE_URL`
