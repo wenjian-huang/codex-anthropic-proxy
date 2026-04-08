@@ -977,13 +977,6 @@ async function callCodexResponsesViaWebSocket(requestBody, auth, context, entry,
     rejectDone = reject;
   });
 
-  const resetIdleTimer = () => {
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      handleFatalError(new UpstreamWebSocketFallbackError('Upstream websocket idle timeout'));
-    }, UPSTREAM_WS_IDLE_TIMEOUT_MS);
-  };
-
   const stream = new ReadableStream({
     start(controller) {
       function cleanup() {
@@ -1003,6 +996,13 @@ async function callCodexResponsesViaWebSocket(requestBody, auth, context, entry,
         }
         rejectDone(error);
         controller.error(error);
+      }
+
+      function resetIdleTimer() {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          handleFatalError(new UpstreamWebSocketFallbackError('Upstream websocket idle timeout'));
+        }, UPSTREAM_WS_IDLE_TIMEOUT_MS);
       }
 
       function finish() {
@@ -1057,8 +1057,9 @@ async function callCodexResponsesViaWebSocket(requestBody, auth, context, entry,
     }
   });
 
-  entry.activeResponseDone = responseDone.finally(() => {
-    if (entry.activeResponseDone === responseDone) {
+  const settledResponseDone = responseDone.catch(() => {});
+  entry.activeResponseDone = settledResponseDone.finally(() => {
+    if (entry.activeResponseDone === settledResponseDone) {
       entry.activeResponseDone = null;
     }
   });

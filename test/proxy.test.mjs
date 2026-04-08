@@ -985,3 +985,106 @@ test('`callCodexResponsesWithFallback` serializes websocket requests within one 
     await new Promise((resolve, reject) => httpServer.close((error) => (error ? reject(error) : resolve())));
   }
 });
+
+test('`callCodexResponsesWithFallback` surfaces websocket overload after response start without unhandled rejection', async () => {
+  const httpServer = createHttpServer();
+  const websocketServer = new WebSocketServer({ noServer: true });
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    websocketServer.handleUpgrade(request, socket, head, (ws) => {
+      websocketServer.emit('connection', ws, request);
+    });
+  });
+
+  websocketServer.on('connection', (ws) => {
+    ws.on('message', () => {
+      ws.send(JSON.stringify({ type: 'response.created', response: { id: 'resp-ws-overloaded' } }));
+      ws.send(JSON.stringify({
+        type: 'error',
+        error: { message: 'Our servers are currently overloaded. Please try again later.' }
+      }));
+    });
+  });
+
+  await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address();
+  const proxy = await importProxyModuleWithEnv({
+    CODEX_UPSTREAM_BASE_URL: `http://127.0.0.1:${port}`
+  });
+
+  try {
+    proxy.resetSessionState();
+    const context = {
+      claudeSessionId: 'session-ws-overloaded',
+      requestId: 'req-ws-overloaded'
+    };
+    const body = {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hello websocket' }]
+    };
+    const prepared = proxy.createContinuationRequest(
+      body,
+      context,
+      proxy.buildResponsesRequest(body, context)
+    );
+    const upstream = await proxy.callCodexResponsesWithFallback(prepared, {
+      tokens: { access_token: 'access-token' }
+    }, context);
+
+    await assert.rejects(readReadableStream(upstream.body), /overloaded/);
+  } finally {
+    proxy.resetSessionState();
+    await new Promise((resolve, reject) => websocketServer.close((error) => (error ? reject(error) : resolve())));
+    await new Promise((resolve, reject) => httpServer.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test('`callCodexResponsesWithFallback` surfaces websocket idle timeout without reference errors', async () => {
+  const httpServer = createHttpServer();
+  const websocketServer = new WebSocketServer({ noServer: true });
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    websocketServer.handleUpgrade(request, socket, head, (ws) => {
+      websocketServer.emit('connection', ws, request);
+    });
+  });
+
+  websocketServer.on('connection', (ws) => {
+    ws.on('message', () => {
+      ws.send(JSON.stringify({ type: 'response.created', response: { id: 'resp-ws-idle' } }));
+    });
+  });
+
+  await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
+  const { port } = httpServer.address();
+  const proxy = await importProxyModuleWithEnv({
+    CODEX_UPSTREAM_BASE_URL: `http://127.0.0.1:${port}`,
+    CODEX_UPSTREAM_WS_IDLE_TIMEOUT_MS: '20'
+  });
+
+  try {
+    proxy.resetSessionState();
+    const context = {
+      claudeSessionId: 'session-ws-idle',
+      requestId: 'req-ws-idle'
+    };
+    const body = {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hello websocket' }]
+    };
+    const prepared = proxy.createContinuationRequest(
+      body,
+      context,
+      proxy.buildResponsesRequest(body, context)
+    );
+    const upstream = await proxy.callCodexResponsesWithFallback(prepared, {
+      tokens: { access_token: 'access-token' }
+    }, context);
+
+    await assert.rejects(readReadableStream(upstream.body), /idle timeout/);
+  } finally {
+    proxy.resetSessionState();
+    await new Promise((resolve, reject) => websocketServer.close((error) => (error ? reject(error) : resolve())));
+    await new Promise((resolve, reject) => httpServer.close((error) => (error ? reject(error) : resolve())));
+  }
+});
